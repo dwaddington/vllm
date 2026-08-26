@@ -529,6 +529,18 @@ class TieringOffloadingManager(OffloadingManager):
         # Both must be accounted for before the eviction decision below.
         self._maybe_process_finished_jobs()
 
+        # A finished request that had no pending primary stores is finalized and
+        # dropped from _req_state in on_request_finished(). The scheduler,
+        # however, intentionally keeps its req_status alive for one more step to
+        # flush the request's trailing block (see OffloadingConnectorScheduler.
+        # request_finished / _build_store_jobs over finished_req_ids). That
+        # deferred store lands here after finalization, so the state is gone.
+        # Skip it rather than KeyError-ing the engine; the scheduler treats a
+        # None return as a benign "cannot store" and cleans the request up.
+        # Mirrors the defensive self._req_state.get() used elsewhere (lookup()).
+        if req_context.req_id not in self._req_state:
+            return None
+
         # Step 2: Store to primary tier (new blocks only).
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer

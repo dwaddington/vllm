@@ -290,10 +290,14 @@ class OffloadingManager(ABC):
         """
         Called when a request has finished.
 
-        By the time this is called, the scheduler will issue no more
-        submit-side calls for this request, such as prepare_store() and
-        prepare_load(). Completion callbacks for already-submitted transfers
-        (complete_store() and complete_load()) may still arrive afterward.
+        Note that a connector scheduler may still issue ONE more prepare_store()
+        for this request after this call, to flush the request's trailing block
+        (OffloadingConnectorScheduler keeps req_status alive for one extra step).
+        mark_stores_submitted() signals when that final store has been submitted;
+        managers that remove per-request state on finish must defer that removal
+        until then, or the trailing prepare_store() will fail. Completion
+        callbacks for already-submitted transfers (complete_store() and
+        complete_load()) may also still arrive afterward.
 
         This hook does NOT imply the data has been persisted. Asynchronous
         transfers already submitted for this request may still be in flight.
@@ -303,6 +307,22 @@ class OffloadingManager(ABC):
 
         Args:
             req_context: per-request context.
+        """
+        return
+
+    def mark_stores_submitted(self, req_id: str) -> None:
+        """
+        Called by the connector scheduler once it has submitted (or determined
+        unnecessary) the deferred trailing-block store for a finished request.
+
+        After on_request_finished(), the scheduler may issue one final
+        prepare_store() for a request's trailing block on a later step. A
+        manager that removes per-request state on finish must keep that state
+        alive until this hook fires, otherwise the trailing prepare_store()
+        indexes missing state. Managers that hold no such state may ignore it.
+
+        Args:
+            req_id: id of the finished request whose stores are now submitted.
         """
         return
 

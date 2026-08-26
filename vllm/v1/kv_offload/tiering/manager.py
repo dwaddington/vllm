@@ -73,6 +73,15 @@ class RequestState:
     is_finished: bool = False
     request_level_tiers: set[SecondaryTierManager] | None = None
     sync_lookup_delay: float = 0.0
+    # GPU-facing lifecycle only: the connector scheduler keeps a finished
+    # request's req_status alive for one more step to flush its trailing block
+    # (OffloadingConnectorScheduler.request_finished / _build_store_jobs). Until
+    # that deferred store has been submitted (or found unnecessary), the request
+    # must not be finalized/removed, or the deferred prepare_store() would index
+    # a missing state and crash the engine with KeyError. needs_store_handshake
+    # marks such requests; stores_submitted is set by mark_stores_submitted().
+    needs_store_handshake: bool = False
+    stores_submitted: bool = False
     # time.monotonic() of this request's first deferred secondary-tier lookup;
     # None once consumed (observed) or while no secondary lookup is pending.
     secondary_lookup_start_time: float | None = None
@@ -693,7 +702,26 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
+        # The GPU-facing connector scheduler (exclude_tier is None) defers this
+        # request's trailing-block store to a later step, so its state must
+        # survive until mark_stores_submitted() is called. Secondary-tier-facing
+        # finishes (exclude_tier set) have no such deferred store and finalize
+        # immediately as before.
+        if exclude_tier is None:
+            state.needs_store_handshake = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier)
+
+    @override
+    def mark_stores_submitted(self, req_id: str) -> None:
+        """Signal from the connector scheduler that it has submitted (or found
+        unnecessary) a finished request's deferred trailing-block store, so the
+        request may now be finalized. No-op for requests that are not finished,
+        not awaiting the handshake, or already finalized/removed."""
+        state = self._req_state.get(req_id)
+        if state is None or not state.needs_store_handshake:
+            return
+        state.stores_submitted = True
+        self._maybe_finalize_request(req_id)
 
     def _maybe_finalize_request(
         self,
@@ -710,6 +738,12 @@ class TieringOffloadingManager(OffloadingManager):
         if not state.is_finished:
             return
         if state.pending_primary_stores != 0:
+            return
+        # Wait for the connector scheduler's trailing-block store handshake
+        # (mark_stores_submitted) before removing GPU-facing request state.
+        # Otherwise the deferred prepare_store() for the final block would index
+        # a deleted state (KeyError -> EngineDeadError under load).
+        if state.needs_store_handshake and not state.stores_submitted:
             return
 
         for tier in self.secondary_tiers:

@@ -459,7 +459,13 @@ class OffloadingConnectorScheduler:
         self, req_id: str, req_status: RequestOffloadState
     ) -> None:
         """Clean up req_status if finished and no in-flight jobs."""
-        if req_status.req.is_finished() and not req_status.transfer_jobs:
+        if not req_status.req.is_finished():
+            return
+        # The finished request has now been through _build_store_jobs' deferred
+        # trailing-store pass; tell the manager it may finalize the request's
+        # state (see TieringOffloadingManager.mark_stores_submitted).
+        self.manager.mark_stores_submitted(req_id)
+        if not req_status.transfer_jobs:
             del self._req_status[req_id]
 
     def _maximal_prefix_lookup(
@@ -1116,6 +1122,9 @@ class OffloadingConnectorScheduler:
                     self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
                     if bid in self._current_batch_allocated_block_ids:
                         self._current_batch_jobs_to_flush.add(job_id)
+                # This was the finished request's deferred trailing-block store;
+                # the manager may finalize once its complete_store() arrives.
+                self.manager.mark_stores_submitted(req_id)
 
         return store_jobs
 
@@ -1283,10 +1292,12 @@ class OffloadingConnectorScheduler:
 
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
-            # nothing was deferred, so finalize immediately.
+            # nothing was deferred, so finalize immediately. No trailing store
+            # will ever be built for it, so release the finalize handshake now.
             req_context = _create_req_context(request)
             self.manager.on_new_request(req_context)
             self.manager.on_request_finished(req_context)
+            self.manager.mark_stores_submitted(req_context.req_id)
             return False, None
 
         self.manager.on_request_finished(req_status.req_context)
